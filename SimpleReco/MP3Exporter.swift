@@ -1,30 +1,26 @@
 import Foundation
 import AVFoundation
+import AppKit
+import UniformTypeIdentifiers
 
 class MP3Exporter {
 
     static func convertToMP3(from sourceURL: URL) async -> URL? {
         let tempDir = FileManager.default.temporaryDirectory
-        let outputURL = tempDir.appendingPathComponent(UUID().uuidString + ".mp3")
+        let m4aURL = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
 
-        let asset = AVAsset(url: sourceURL)
+        let asset = AVURLAsset(url: sourceURL)
 
         guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
             print("Failed to create export session")
             return await convertUsingAudioFile(from: sourceURL)
         }
 
-        let m4aURL = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
-        exportSession.outputURL = m4aURL
-        exportSession.outputFileType = .m4a
-        exportSession.audioTimePitchAlgorithm = .spectral
-
-        await exportSession.export()
-
-        if exportSession.status == .completed {
+        do {
+            try await exportSession.export(to: m4aURL, as: .m4a)
             return m4aURL
-        } else {
-            print("Export failed: \(exportSession.error?.localizedDescription ?? "unknown")")
+        } catch {
+            print("Export failed: \(error.localizedDescription)")
             return await convertUsingAudioFile(from: sourceURL)
         }
     }
@@ -41,22 +37,6 @@ class MP3Exporter {
 
             try sourceFile.read(into: buffer)
 
-            let outputSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEGLayer3,
-                AVSampleRateKey: 48000,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 320000
-            ]
-
-            let tempDir = FileManager.default.temporaryDirectory
-            let outputURL = tempDir.appendingPathComponent(UUID().uuidString + ".mp3")
-
-            if let outputFormat = AVAudioFormat(settings: outputSettings) {
-                let outputFile = try AVAudioFile(forWriting: outputURL, settings: outputSettings)
-                try outputFile.write(from: buffer)
-                return outputURL
-            }
-
             let aacSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: 48000,
@@ -64,6 +44,7 @@ class MP3Exporter {
                 AVEncoderBitRateKey: 320000
             ]
 
+            let tempDir = FileManager.default.temporaryDirectory
             let aacURL = tempDir.appendingPathComponent(UUID().uuidString + ".m4a")
             let aacFile = try AVAudioFile(forWriting: aacURL, settings: aacSettings)
             try aacFile.write(from: buffer)
@@ -87,7 +68,7 @@ class MP3Exporter {
         var filename: String
 
         repeat {
-            filename = "Recording_\(dateString)_\(String(format: "%02d", sequenceNumber)).mp3"
+            filename = "Recording_\(dateString)_\(String(format: "%02d", sequenceNumber)).m4a"
             sequenceNumber += 1
         } while FileManager.default.fileExists(atPath: downloadsURL.appendingPathComponent(filename).path)
 
@@ -117,7 +98,7 @@ class MP3Exporter {
 
     static func saveWithPicker(from sourceURL: URL, suggestedName: String? = nil) {
         let savePanel = NSSavePanel()
-        savePanel.allowedContentTypes = [.mp3, .mpeg4Audio]
+        savePanel.allowedContentTypes = [UTType.mpeg4Audio, UTType.audio]
         savePanel.nameFieldStringValue = suggestedName ?? generateFilename()
         savePanel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
 
