@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var isPlaying = false
     @State private var playbackProgress: Double = 0
     @State private var playbackTimer: Timer?
+    @State private var playbackDelegate: PlaybackDelegate?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -50,9 +51,19 @@ struct ContentView: View {
     }
 
     private var durationLabel: some View {
-        Text(recordingState.formattedDuration)
+        Text(formattedTime)
             .font(.system(.body, design: .monospaced))
             .foregroundColor(.secondary)
+    }
+
+    private var formattedTime: String {
+        if isPlaying, let player = audioPlayer {
+            let current = Int(player.currentTime)
+            let minutes = current / 60
+            let seconds = current % 60
+            return String(format: "%02d:%02d", minutes, seconds)
+        }
+        return recordingState.formattedDuration
     }
 
     private var controlsSection: some View {
@@ -61,7 +72,7 @@ struct ContentView: View {
 
             Spacer()
 
-            recordButton
+            mainButton
 
             Spacer()
 
@@ -76,36 +87,66 @@ struct ContentView: View {
                 .frame(width: 60)
         }
         .buttonStyle(.bordered)
-        .disabled(recordingState.status == .idle)
+        .disabled(recordingState.status == .idle || recordingState.status == .recording)
     }
 
-    private var recordButton: some View {
-        Button(action: toggleRecording) {
+    private var mainButton: some View {
+        Button(action: handleMainButtonTap) {
             ZStack {
                 Circle()
-                    .fill(recordButtonColor)
+                    .fill(mainButtonBackgroundColor)
                     .frame(width: 44, height: 44)
 
-                if recordingState.status == .recording {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.white)
-                        .frame(width: 16, height: 16)
-                } else {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 20, height: 20)
-                }
+                mainButtonIcon
             }
         }
         .buttonStyle(.plain)
         .disabled(!recordingState.permissionGranted)
     }
 
-    private var recordButtonColor: Color {
+    @ViewBuilder
+    private var mainButtonIcon: some View {
+        switch recordingState.status {
+        case .idle:
+            // Record icon - filled circle
+            Circle()
+                .fill(Color.white)
+                .frame(width: 20, height: 20)
+
+        case .recording:
+            // Stop icon - square
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.white)
+                .frame(width: 16, height: 16)
+
+        case .recorded:
+            // Play icon - triangle
+            Image(systemName: "play.fill")
+                .font(.system(size: 18))
+                .foregroundColor(.white)
+                .offset(x: 2)
+
+        case .playing:
+            // Pause icon - two bars
+            Image(systemName: "pause.fill")
+                .font(.system(size: 18))
+                .foregroundColor(.white)
+        }
+    }
+
+    private var mainButtonBackgroundColor: Color {
         if !recordingState.permissionGranted {
             return .gray
         }
-        return recordingState.status == .recording ? .red : .red.opacity(0.8)
+
+        switch recordingState.status {
+        case .idle:
+            return .red.opacity(0.8)
+        case .recording:
+            return .red
+        case .recorded, .playing:
+            return .blue
+        }
     }
 
     private var saveButton: some View {
@@ -127,17 +168,25 @@ struct ContentView: View {
         .disabled(recordingState.status != .recorded && recordingState.status != .playing)
     }
 
-    private func toggleRecording() {
-        stopPlayback()
-
-        if recordingState.status == .recording {
-            appDelegate?.stopRecording()
-        } else {
-            if recordingState.status == .recorded {
-                clearRecording()
-            }
-            appDelegate?.startRecording()
+    private func handleMainButtonTap() {
+        switch recordingState.status {
+        case .idle:
+            startRecording()
+        case .recording:
+            stopRecording()
+        case .recorded:
+            startPlayback()
+        case .playing:
+            pausePlayback()
         }
+    }
+
+    private func startRecording() {
+        appDelegate?.startRecording()
+    }
+
+    private func stopRecording() {
+        appDelegate?.stopRecording()
     }
 
     private func clearRecording() {
@@ -147,20 +196,24 @@ struct ContentView: View {
 
     private func togglePlayback() {
         if isPlaying {
-            stopPlayback()
+            pausePlayback()
         } else {
             startPlayback()
         }
     }
 
     private func startPlayback() {
-        guard let url = recordingState.audioURL else { return }
+        guard let url = recordingState.audioURL else {
+            print("No audio URL available")
+            return
+        }
 
         do {
             audioPlayer = try AVAudioPlayer(contentsOf: url)
-            audioPlayer?.delegate = PlaybackDelegate { [self] in
+            playbackDelegate = PlaybackDelegate { [self] in
                 stopPlayback()
             }
+            audioPlayer?.delegate = playbackDelegate
             audioPlayer?.play()
             isPlaying = true
             recordingState.status = .playing
@@ -175,9 +228,18 @@ struct ContentView: View {
         }
     }
 
+    private func pausePlayback() {
+        audioPlayer?.pause()
+        isPlaying = false
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        recordingState.status = .recorded
+    }
+
     private func stopPlayback() {
         audioPlayer?.stop()
         audioPlayer = nil
+        playbackDelegate = nil
         isPlaying = false
         playbackProgress = 0
         playbackTimer?.invalidate()

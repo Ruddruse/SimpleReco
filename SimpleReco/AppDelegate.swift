@@ -212,33 +212,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let file = try AVAudioFile(forReading: url)
                 let format = file.processingFormat
-                let frameCount = UInt32(file.length)
+                let frameCount = AVAudioFrameCount(file.length)
 
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+                guard frameCount > 0 else {
+                    print("No frames in audio file")
+                    return
+                }
+
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                    print("Failed to create buffer")
+                    return
+                }
                 try file.read(into: buffer)
 
-                guard let floatData = buffer.floatChannelData?[0] else { return }
-
                 let sampleCount = 50
-                let samplesPerBucket = Int(frameCount) / sampleCount
                 var samples: [Float] = []
 
-                for i in 0..<sampleCount {
-                    let start = i * samplesPerBucket
-                    let end = min(start + samplesPerBucket, Int(frameCount))
-
-                    var sum: Float = 0
-                    for j in start..<end {
-                        sum += abs(floatData[j])
+                if format.isInterleaved {
+                    guard let floatData = buffer.floatChannelData?[0] else {
+                        print("No float channel data (interleaved)")
+                        return
                     }
-                    let avg = sum / Float(end - start)
-                    samples.append(avg)
+                    let totalSamples = Int(buffer.frameLength) * Int(format.channelCount)
+                    let samplesPerBucket = totalSamples / sampleCount
+
+                    for i in 0..<sampleCount {
+                        let start = i * samplesPerBucket
+                        let end = min(start + samplesPerBucket, totalSamples)
+                        var sum: Float = 0
+                        for j in start..<end {
+                            sum += abs(floatData[j])
+                        }
+                        let avg = sum / Float(end - start)
+                        samples.append(avg)
+                    }
+                } else {
+                    guard let floatData = buffer.floatChannelData?[0] else {
+                        print("No float channel data (non-interleaved)")
+                        return
+                    }
+                    let samplesPerBucket = Int(buffer.frameLength) / sampleCount
+
+                    for i in 0..<sampleCount {
+                        let start = i * samplesPerBucket
+                        let end = min(start + samplesPerBucket, Int(buffer.frameLength))
+                        var sum: Float = 0
+                        for j in start..<end {
+                            sum += abs(floatData[j])
+                        }
+                        let avg = sum / Float(end - start)
+                        samples.append(avg)
+                    }
                 }
 
                 let maxSample = samples.max() ?? 1.0
                 if maxSample > 0 {
                     samples = samples.map { $0 / maxSample }
                 }
+
+                print("Generated waveform with \(samples.count) samples, max: \(maxSample)")
 
                 await MainActor.run {
                     recordingState.setFinalWaveform(samples)
