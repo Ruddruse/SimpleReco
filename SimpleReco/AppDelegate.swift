@@ -21,9 +21,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem?.button {
             updateMenuBarIcon(isRecording: false)
-            button.action = #selector(toggleWindow)
+            button.action = #selector(handleClick)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
         }
+    }
+
+    @objc private func handleClick() {
+        guard let event = NSApp.currentEvent else {
+            toggleWindow()
+            return
+        }
+
+        if event.type == .rightMouseUp {
+            showMenu()
+        } else {
+            toggleWindow()
+        }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Open SimpleReco", action: #selector(toggleWindow), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q"))
+
+        statusItem?.menu = menu
+        statusItem?.button?.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc private func quitApp() {
+        if recordingState.status == .recording {
+            clearRecording()
+        }
+        NSApp.terminate(nil)
     }
 
     func updateMenuBarIcon(isRecording: Bool) {
