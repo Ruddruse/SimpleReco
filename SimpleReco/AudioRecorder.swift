@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import AudioToolbox
 
 class AudioRecorder: NSObject {
     private var stream: SCStream?
@@ -17,6 +18,52 @@ class AudioRecorder: NSObject {
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
         super.init()
+    }
+
+    private func getSystemAudioSampleRate() -> Double {
+        var deviceID = AudioDeviceID()
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+
+        guard status == noErr else {
+            print("Failed to get default output device, using 48000 Hz")
+            return 48000
+        }
+
+        var sampleRate: Float64 = 0
+        size = UInt32(MemoryLayout<Float64>.size)
+        address.mSelector = kAudioDevicePropertyNominalSampleRate
+        address.mScope = kAudioObjectPropertyScopeGlobal
+
+        let rateStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &address,
+            0,
+            nil,
+            &size,
+            &sampleRate
+        )
+
+        guard rateStatus == noErr, sampleRate > 0 else {
+            print("Failed to get sample rate, using 48000 Hz")
+            return 48000
+        }
+
+        print("System audio sample rate: \(sampleRate) Hz")
+        return sampleRate
     }
 
     func startRecording() {
@@ -36,8 +83,11 @@ class AudioRecorder: NSObject {
                 let config = SCStreamConfiguration()
                 config.capturesAudio = true
                 config.excludesCurrentProcessAudio = true
-                config.sampleRate = 48000
+                // Use system's native sample rate to avoid resampling issues
+                let nativeSampleRate = self.getSystemAudioSampleRate()
+                config.sampleRate = Int(nativeSampleRate)
                 config.channelCount = 2
+                print("Requesting audio at \(config.sampleRate) Hz")
 
                 config.width = 2
                 config.height = 2
@@ -165,13 +215,21 @@ extension AudioRecorder: SCStreamOutput {
 
         let sampleRate = asbd.pointee.mSampleRate
         let channelCount = asbd.pointee.mChannelsPerFrame
+        let bytesPerFrame = Int(asbd.pointee.mBytesPerFrame)
+        let bitsPerChannel = asbd.pointee.mBitsPerChannel
+        let formatFlags = asbd.pointee.mFormatFlags
 
         if isFirstBuffer {
             isFirstBuffer = false
             actualSampleRate = sampleRate
             actualChannelCount = channelCount
             audioFile = createAudioFile(sampleRate: sampleRate, channelCount: channelCount)
-            print("Audio format from stream: \(sampleRate) Hz, \(channelCount) channels")
+            print("Audio format from stream:")
+            print("  Sample rate: \(sampleRate) Hz")
+            print("  Channels: \(channelCount)")
+            print("  Bytes per frame: \(bytesPerFrame)")
+            print("  Bits per channel: \(bitsPerChannel)")
+            print("  Format flags: \(formatFlags) (isFloat=\(formatFlags & 1), isNonInterleaved=\((formatFlags >> 5) & 1))")
         }
 
         guard let audioFile = audioFile, let fileFormat = fileFormat else { return }
@@ -184,9 +242,9 @@ extension AudioRecorder: SCStreamOutput {
 
         guard let data = dataPointer else { return }
 
-        let bytesPerSample = MemoryLayout<Float>.size
-        let totalSamples = length / bytesPerSample
-        let frameCount = totalSamples / Int(channelCount)
+        // Use actual bytes per frame from ASBD instead of assuming Float32
+        let frameCount = bytesPerFrame > 0 ? length / bytesPerFrame : 0
+        let totalSamples = frameCount * Int(channelCount)
 
         guard frameCount > 0 else { return }
 
