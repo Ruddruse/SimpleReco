@@ -133,18 +133,9 @@ class AudioRecorder: NSObject {
                     return
                 }
 
-                print("Converting to M4A...")
-                let convertedURL = await MP3Exporter.convertToMP3(from: tempURL)
-
-                try? fileManager.removeItem(at: tempURL)
-
-                if let url = convertedURL {
-                    print("Conversion successful: \(url.path)")
-                } else {
-                    print("Conversion failed!")
-                }
-
-                completion(convertedURL)
+                // Skip conversion - use WAV directly to preserve sample rate
+                print("Recording complete: \(tempURL.path)")
+                completion(tempURL)
 
             } catch {
                 print("Error stopping capture: \(error)")
