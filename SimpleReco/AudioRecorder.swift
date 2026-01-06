@@ -12,6 +12,7 @@ class AudioRecorder: NSObject {
     private var actualChannelCount: UInt32 = 2
     private var isFirstBuffer: Bool = true
     private var totalFramesWritten: Int64 = 0
+    private var fileFormat: AVAudioFormat?
 
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
@@ -48,6 +49,8 @@ class AudioRecorder: NSObject {
                 self.tempFileURL = tempFile
                 self.isFirstBuffer = true
                 self.totalFramesWritten = 0
+                self.audioFile = nil
+                self.fileFormat = nil
 
                 stream = SCStream(filter: filter, configuration: config, delegate: self)
 
@@ -67,19 +70,23 @@ class AudioRecorder: NSObject {
     private func createAudioFile(sampleRate: Double, channelCount: UInt32) -> AVAudioFile? {
         guard let tempFile = tempFileURL else { return nil }
 
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: sampleRate,
-            AVNumberOfChannelsKey: channelCount,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: false
-        ]
+        // Use standard non-interleaved format for the file
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: channelCount,
+            interleaved: false
+        ) else {
+            print("Failed to create audio format")
+            return nil
+        }
+
+        self.fileFormat = format
 
         do {
-            let file = try AVAudioFile(forWriting: tempFile, settings: audioSettings)
+            let file = try AVAudioFile(forWriting: tempFile, settings: format.settings)
             print("Created audio file at: \(tempFile.path)")
+            print("File format: \(format)")
             return file
         } catch {
             print("Error creating audio file: \(error)")
@@ -93,10 +100,9 @@ class AudioRecorder: NSObject {
                 try await stream?.stopCapture()
                 stream = nil
 
-                // Important: Close the audio file by setting it to nil
-                // This ensures all data is flushed to disk
                 let framesWritten = totalFramesWritten
                 audioFile = nil
+                fileFormat = nil
 
                 print("Recording stopped. Total frames written: \(framesWritten)")
 
@@ -106,7 +112,6 @@ class AudioRecorder: NSObject {
                     return
                 }
 
-                // Check if file exists and has content
                 let fileManager = FileManager.default
                 if fileManager.fileExists(atPath: tempURL.path) {
                     do {
@@ -114,7 +119,7 @@ class AudioRecorder: NSObject {
                         let fileSize = attributes[.size] as? Int64 ?? 0
                         print("Temp file size: \(fileSize) bytes")
 
-                        if fileSize == 0 {
+                        if fileSize == 0 || framesWritten == 0 {
                             print("Warning: Audio file is empty!")
                             completion(nil)
                             return
@@ -128,11 +133,9 @@ class AudioRecorder: NSObject {
                     return
                 }
 
-                // Convert to M4A
                 print("Converting to M4A...")
                 let convertedURL = await MP3Exporter.convertToMP3(from: tempURL)
 
-                // Clean up temp file
                 try? fileManager.removeItem(at: tempURL)
 
                 if let url = convertedURL {
@@ -177,10 +180,10 @@ extension AudioRecorder: SCStreamOutput {
             actualSampleRate = sampleRate
             actualChannelCount = channelCount
             audioFile = createAudioFile(sampleRate: sampleRate, channelCount: channelCount)
-            print("Audio format: \(sampleRate) Hz, \(channelCount) channels")
+            print("Audio format from stream: \(sampleRate) Hz, \(channelCount) channels")
         }
 
-        guard let audioFile = audioFile else { return }
+        guard let audioFile = audioFile, let fileFormat = fileFormat else { return }
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
 
@@ -190,25 +193,29 @@ extension AudioRecorder: SCStreamOutput {
 
         guard let data = dataPointer else { return }
 
-        let bytesPerFrame = MemoryLayout<Float>.size * Int(channelCount)
-        let frameCount = length / bytesPerFrame
+        let bytesPerSample = MemoryLayout<Float>.size
+        let totalSamples = length / bytesPerSample
+        let frameCount = totalSamples / Int(channelCount)
 
         guard frameCount > 0 else { return }
 
-        guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: channelCount,
-            interleaved: true
-        ) else { return }
-
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
+        // Create buffer matching the file format (non-interleaved)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: fileFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
+            print("Failed to create buffer")
+            return
+        }
         buffer.frameLength = AVAudioFrameCount(frameCount)
 
-        if let bufferData = buffer.floatChannelData?[0] {
-            let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
-            for i in 0..<(frameCount * Int(channelCount)) {
-                bufferData[i] = floatPointer[i]
+        // Input data is interleaved: L0 R0 L1 R1 L2 R2 ...
+        // Output needs to be non-interleaved: L0 L1 L2 ... | R0 R1 R2 ...
+        let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: totalSamples)
+
+        if let channelData = buffer.floatChannelData {
+            for frame in 0..<frameCount {
+                for channel in 0..<Int(channelCount) {
+                    let inputIndex = frame * Int(channelCount) + channel
+                    channelData[channel][frame] = floatPointer[inputIndex]
+                }
             }
         }
 
@@ -219,12 +226,11 @@ extension AudioRecorder: SCStreamOutput {
             print("Error writing audio: \(error)")
         }
 
-        // Update live waveform
-        let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
+        // Update live waveform (use left channel)
         var sum: Float = 0
-        let samplesToCheck = min(frameCount * Int(channelCount), 1000)
+        let samplesToCheck = min(frameCount, 500)
         for i in 0..<samplesToCheck {
-            sum += abs(floatPointer[i])
+            sum += abs(floatPointer[i * Int(channelCount)])
         }
         let avg = sum / Float(samplesToCheck)
 
