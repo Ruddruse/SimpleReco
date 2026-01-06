@@ -8,12 +8,12 @@ class AudioRecorder: NSObject {
     private var audioFile: AVAudioFile?
     private var tempFileURL: URL?
     private var recordingState: RecordingState
-    private var sampleBuffer: [Float] = []
-    private let outputFormat: AVAudioFormat
+    private var actualSampleRate: Double = 48000
+    private var actualChannelCount: UInt32 = 2
+    private var isFirstBuffer: Bool = true
 
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
-        self.outputFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
         super.init()
     }
 
@@ -45,25 +45,7 @@ class AudioRecorder: NSObject {
                 let tempDir = FileManager.default.temporaryDirectory
                 let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".wav")
                 self.tempFileURL = tempFile
-
-                let audioSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVSampleRateKey: 48000,
-                    AVNumberOfChannelsKey: 2,
-                    AVLinearPCMBitDepthKey: 32,
-                    AVLinearPCMIsFloatKey: true,
-                    AVLinearPCMIsBigEndianKey: false,
-                    AVLinearPCMIsNonInterleaved: false
-                ]
-
-                guard let format = AVAudioFormat(settings: audioSettings) else {
-                    await MainActor.run {
-                        recordingState.errorMessage = "Failed to create audio format"
-                    }
-                    return
-                }
-
-                self.audioFile = try AVAudioFile(forWriting: tempFile, settings: audioSettings)
+                self.isFirstBuffer = true
 
                 stream = SCStream(filter: filter, configuration: config, delegate: self)
 
@@ -76,6 +58,27 @@ class AudioRecorder: NSObject {
                     recordingState.errorMessage = "Failed to start recording: \(error.localizedDescription)"
                 }
             }
+        }
+    }
+
+    private func createAudioFile(sampleRate: Double, channelCount: UInt32) -> AVAudioFile? {
+        guard let tempFile = tempFileURL else { return nil }
+
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: sampleRate,
+            AVNumberOfChannelsKey: channelCount,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+
+        do {
+            return try AVAudioFile(forWriting: tempFile, settings: audioSettings)
+        } catch {
+            print("Error creating audio file: \(error)")
+            return nil
         }
     }
 
@@ -113,6 +116,22 @@ extension AudioRecorder: SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
 
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return
+        }
+
+        let sampleRate = asbd.pointee.mSampleRate
+        let channelCount = asbd.pointee.mChannelsPerFrame
+
+        if isFirstBuffer {
+            isFirstBuffer = false
+            actualSampleRate = sampleRate
+            actualChannelCount = channelCount
+            audioFile = createAudioFile(sampleRate: sampleRate, channelCount: channelCount)
+            print("Audio format: \(sampleRate) Hz, \(channelCount) channels")
+        }
+
         guard let audioFile = audioFile else { return }
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
@@ -123,20 +142,25 @@ extension AudioRecorder: SCStreamOutput {
 
         guard let data = dataPointer else { return }
 
-        let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
-        let frameCount = length / (MemoryLayout<Float>.size * 2)
+        let bytesPerFrame = MemoryLayout<Float>.size * Int(channelCount)
+        let frameCount = length / bytesPerFrame
 
         guard frameCount > 0 else { return }
 
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: channelCount,
+            interleaved: true
+        ) else { return }
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
         buffer.frameLength = AVAudioFrameCount(frameCount)
 
-        if let channelData = buffer.floatChannelData {
-            for frame in 0..<frameCount {
-                let leftSample = floatPointer[frame * 2]
-                let rightSample = floatPointer[frame * 2 + 1]
-                channelData[0][frame] = leftSample
-                channelData[1][frame] = rightSample
+        if let bufferData = buffer.floatChannelData?[0] {
+            let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
+            for i in 0..<(frameCount * Int(channelCount)) {
+                bufferData[i] = floatPointer[i]
             }
         }
 
@@ -146,11 +170,13 @@ extension AudioRecorder: SCStreamOutput {
             print("Error writing audio: \(error)")
         }
 
+        let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
         var sum: Float = 0
-        for i in 0..<min(frameCount, 1000) {
-            sum += abs(floatPointer[i * 2])
+        let samplesToCheck = min(frameCount * Int(channelCount), 1000)
+        for i in 0..<samplesToCheck {
+            sum += abs(floatPointer[i])
         }
-        let avg = sum / Float(min(frameCount, 1000))
+        let avg = sum / Float(samplesToCheck)
 
         Task { @MainActor in
             recordingState.appendLiveSample(avg * 5)
