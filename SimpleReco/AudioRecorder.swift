@@ -11,6 +11,7 @@ class AudioRecorder: NSObject {
     private var actualSampleRate: Double = 48000
     private var actualChannelCount: UInt32 = 2
     private var isFirstBuffer: Bool = true
+    private var totalFramesWritten: Int64 = 0
 
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
@@ -46,12 +47,14 @@ class AudioRecorder: NSObject {
                 let tempFile = tempDir.appendingPathComponent(UUID().uuidString + ".wav")
                 self.tempFileURL = tempFile
                 self.isFirstBuffer = true
+                self.totalFramesWritten = 0
 
                 stream = SCStream(filter: filter, configuration: config, delegate: self)
 
                 try stream?.addStreamOutput(self, type: .audio, sampleHandlerQueue: .global(qos: .userInteractive))
 
                 try await stream?.startCapture()
+                print("Recording started")
 
             } catch {
                 await MainActor.run {
@@ -75,7 +78,9 @@ class AudioRecorder: NSObject {
         ]
 
         do {
-            return try AVAudioFile(forWriting: tempFile, settings: audioSettings)
+            let file = try AVAudioFile(forWriting: tempFile, settings: audioSettings)
+            print("Created audio file at: \(tempFile.path)")
+            return file
         } catch {
             print("Error creating audio file: \(error)")
             return nil
@@ -87,15 +92,57 @@ class AudioRecorder: NSObject {
             do {
                 try await stream?.stopCapture()
                 stream = nil
+
+                // Important: Close the audio file by setting it to nil
+                // This ensures all data is flushed to disk
+                let framesWritten = totalFramesWritten
                 audioFile = nil
 
-                if let tempURL = tempFileURL {
-                    let mp3URL = await MP3Exporter.convertToMP3(from: tempURL)
-                    try? FileManager.default.removeItem(at: tempURL)
-                    completion(mp3URL)
-                } else {
+                print("Recording stopped. Total frames written: \(framesWritten)")
+
+                guard let tempURL = tempFileURL else {
+                    print("No temp URL")
                     completion(nil)
+                    return
                 }
+
+                // Check if file exists and has content
+                let fileManager = FileManager.default
+                if fileManager.fileExists(atPath: tempURL.path) {
+                    do {
+                        let attributes = try fileManager.attributesOfItem(atPath: tempURL.path)
+                        let fileSize = attributes[.size] as? Int64 ?? 0
+                        print("Temp file size: \(fileSize) bytes")
+
+                        if fileSize == 0 {
+                            print("Warning: Audio file is empty!")
+                            completion(nil)
+                            return
+                        }
+                    } catch {
+                        print("Error getting file attributes: \(error)")
+                    }
+                } else {
+                    print("Temp file does not exist!")
+                    completion(nil)
+                    return
+                }
+
+                // Convert to M4A
+                print("Converting to M4A...")
+                let convertedURL = await MP3Exporter.convertToMP3(from: tempURL)
+
+                // Clean up temp file
+                try? fileManager.removeItem(at: tempURL)
+
+                if let url = convertedURL {
+                    print("Conversion successful: \(url.path)")
+                } else {
+                    print("Conversion failed!")
+                }
+
+                completion(convertedURL)
+
             } catch {
                 print("Error stopping capture: \(error)")
                 completion(nil)
@@ -106,6 +153,7 @@ class AudioRecorder: NSObject {
 
 extension AudioRecorder: SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("Stream stopped with error: \(error)")
         Task { @MainActor in
             recordingState.errorMessage = "Stream stopped: \(error.localizedDescription)"
         }
@@ -166,10 +214,12 @@ extension AudioRecorder: SCStreamOutput {
 
         do {
             try audioFile.write(from: buffer)
+            totalFramesWritten += Int64(frameCount)
         } catch {
             print("Error writing audio: \(error)")
         }
 
+        // Update live waveform
         let floatPointer = UnsafeRawPointer(data).bindMemory(to: Float.self, capacity: length / MemoryLayout<Float>.size)
         var sum: Float = 0
         let samplesToCheck = min(frameCount * Int(channelCount), 1000)
