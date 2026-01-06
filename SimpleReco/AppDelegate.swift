@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import ScreenCaptureKit
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem?
     var floatingWindow: NSWindow?
@@ -231,9 +232,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 extension AppDelegate: NSWindowDelegate {
-    func windowWillClose(_ notification: Notification) {
-        if recordingState.status == .recording {
-            clearRecording()
+    nonisolated func windowWillClose(_ notification: Notification) {
+        Task { @MainActor in
+            if recordingState.status == .recording {
+                clearRecording()
+            }
         }
     }
 }
