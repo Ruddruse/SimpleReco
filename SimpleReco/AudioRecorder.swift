@@ -14,6 +14,9 @@ class AudioRecorder: NSObject {
     private var isFirstBuffer: Bool = true
     private var totalFramesWritten: Int64 = 0
     private var fileFormat: AVAudioFormat?
+    private var detectedSampleRate: Double?
+    private var sampleRateCalibrationFrames: Int64 = 0
+    private var sampleRateCalibrationDuration: Double = 0
 
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
@@ -101,6 +104,9 @@ class AudioRecorder: NSObject {
                 self.totalFramesWritten = 0
                 self.audioFile = nil
                 self.fileFormat = nil
+                self.detectedSampleRate = nil
+                self.sampleRateCalibrationFrames = 0
+                self.sampleRateCalibrationDuration = 0
 
                 stream = SCStream(filter: filter, configuration: config, delegate: self)
 
@@ -213,26 +219,11 @@ extension AudioRecorder: SCStreamOutput {
             return
         }
 
-        let sampleRate = asbd.pointee.mSampleRate
+        let asbdSampleRate = asbd.pointee.mSampleRate
         let channelCount = asbd.pointee.mChannelsPerFrame
         let bytesPerFrame = Int(asbd.pointee.mBytesPerFrame)
         let bitsPerChannel = asbd.pointee.mBitsPerChannel
         let formatFlags = asbd.pointee.mFormatFlags
-
-        if isFirstBuffer {
-            isFirstBuffer = false
-            actualSampleRate = sampleRate
-            actualChannelCount = channelCount
-            audioFile = createAudioFile(sampleRate: sampleRate, channelCount: channelCount)
-            print("Audio format from stream:")
-            print("  Sample rate: \(sampleRate) Hz")
-            print("  Channels: \(channelCount)")
-            print("  Bytes per frame: \(bytesPerFrame)")
-            print("  Bits per channel: \(bitsPerChannel)")
-            print("  Format flags: \(formatFlags) (isFloat=\(formatFlags & 1), isNonInterleaved=\((formatFlags >> 5) & 1))")
-        }
-
-        guard let audioFile = audioFile, let fileFormat = fileFormat else { return }
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
 
@@ -242,11 +233,57 @@ extension AudioRecorder: SCStreamOutput {
 
         guard let data = dataPointer else { return }
 
-        // Use actual bytes per frame from ASBD instead of assuming Float32
+        // Use actual bytes per frame from ASBD
         let frameCount = bytesPerFrame > 0 ? length / bytesPerFrame : 0
-        let totalSamples = frameCount * Int(channelCount)
-
         guard frameCount > 0 else { return }
+
+        // Calculate actual sample rate from buffer timing
+        let duration = CMSampleBufferGetDuration(sampleBuffer)
+        let durationSeconds = CMTimeGetSeconds(duration)
+
+        if isFirstBuffer {
+            isFirstBuffer = false
+            actualChannelCount = channelCount
+            print("Audio format from stream (ASBD):")
+            print("  ASBD Sample rate: \(asbdSampleRate) Hz")
+            print("  Channels: \(channelCount)")
+            print("  Bytes per frame: \(bytesPerFrame)")
+            print("  Bits per channel: \(bitsPerChannel)")
+            print("  Format flags: \(formatFlags) (isFloat=\(formatFlags & 1), isNonInterleaved=\((formatFlags >> 5) & 1))")
+        }
+
+        // Accumulate timing data to detect actual sample rate
+        if detectedSampleRate == nil {
+            sampleRateCalibrationFrames += Int64(frameCount)
+            if durationSeconds > 0 && durationSeconds.isFinite {
+                sampleRateCalibrationDuration += durationSeconds
+            }
+
+            // After accumulating ~0.1 seconds of audio, calculate actual rate
+            if sampleRateCalibrationDuration >= 0.1 {
+                let calculatedRate = Double(sampleRateCalibrationFrames) / sampleRateCalibrationDuration
+                // Round to nearest standard rate
+                let standardRates: [Double] = [44100, 48000, 88200, 96000]
+                detectedSampleRate = standardRates.min(by: { abs($0 - calculatedRate) < abs($1 - calculatedRate) }) ?? calculatedRate
+
+                print("Timing-based sample rate detection:")
+                print("  Frames: \(sampleRateCalibrationFrames), Duration: \(sampleRateCalibrationDuration)s")
+                print("  Calculated rate: \(calculatedRate) Hz")
+                print("  Using rate: \(detectedSampleRate!) Hz")
+
+                if abs(detectedSampleRate! - asbdSampleRate) > 1000 {
+                    print("  WARNING: ASBD rate (\(asbdSampleRate)) differs from actual rate (\(detectedSampleRate!))!")
+                }
+
+                actualSampleRate = detectedSampleRate!
+                audioFile = createAudioFile(sampleRate: detectedSampleRate!, channelCount: channelCount)
+            }
+        }
+
+        // Don't write until we've detected the sample rate and created the file
+        guard let audioFile = audioFile, let fileFormat = fileFormat else { return }
+
+        let totalSamples = frameCount * Int(channelCount)
 
         // Create buffer matching the file format (non-interleaved)
         guard let buffer = AVAudioPCMBuffer(pcmFormat: fileFormat, frameCapacity: AVAudioFrameCount(frameCount)) else {
